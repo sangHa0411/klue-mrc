@@ -23,7 +23,6 @@ from models.model import RobertaForQuestionAnswering
 
 def train(args):
 
-    # warnings.filterwarnings(action='ignore')
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     
     # -- Seed
@@ -161,7 +160,7 @@ def train(args):
                     "train/step" : step
                 }
                 print(info)
-                # wandb.log(info)
+                wandb.log(info)
 
             # -- Validation
             with torch.no_grad() :
@@ -198,14 +197,19 @@ def train(args):
                         validation_position_loss += (start_loss + end_loss) / 2
                         validation_impossible_loss += loss_bce(impossible_logits, is_impossible)
 
+                    # validation loss
                     validation_position_loss /= len(validation_dataloder)
                     validation_impossible_loss /= len(validation_dataloder)
 
+                    # postprocess validation logits
                     prediction_logit_vectors = {"start_logits" : start_logit_vectors, "end_logits" : end_logit_vectors, "impossible_logits" : impossible_logit_vectors}
                     validation_predictions = postprocessor.predict(prediction_logit_vectors)
 
+                    # validation metircs
                     validation_metrics = metrics.compute_metrics(validation_predictions, validation_labels)
                     validation_info = {"eval/" + k : v for k, v in validation_metrics.items()}
+                    validation_info["eval/position_loss"] = round(validation_position_loss.item(), 4)
+                    validation_info["eval/impossible_loss"] = round(validation_impossible_loss.item(), 4)
                     print(validation_info)
                     wandb.log(validation_info)
 
