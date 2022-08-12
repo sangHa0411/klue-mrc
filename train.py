@@ -5,6 +5,7 @@ import random
 import numpy as np
 import argparse
 import wandb
+import transformers
 from tqdm import tqdm
 from dotenv import load_dotenv
 
@@ -74,6 +75,7 @@ def train(args):
         num_workers=args.num_workers,
         collate_fn=data_collator
     )
+    train_data_iterator = iter(train_dataloader)
 
     validation_dataloder = DataLoader(validation_dataset, 
         batch_size=args.batch_size, 
@@ -90,8 +92,12 @@ def train(args):
 
     # -- Optimizer & Scheduler
     total_steps = len(train_dataloader) * args.epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    scheduler = LinearWarmupScheduler(optimizer=optimizer, total_steps=total_steps, warmup_ratio=args.warmup_ratio)
+    scheduler = LinearWarmupScheduler(optimizer=optimizer, 
+        total_steps=total_steps, 
+        warmup_steps=warmup_steps
+    )
 
     # -- Loss
     loss_ce = torch.nn.CrossEntropyLoss().to(device)
@@ -117,111 +123,113 @@ def train(args):
     wandb.config.update(training_args)
 
     # -- Training
-    step = 0
-    for epoch in tqdm(range(args.epochs)):
-        print("%dth Epoch" %(epoch+1))
-        model.train()
+    train_position_loss, train_impossible_loss = 0.0, 0.0
+    for step in tqdm(range(total_steps)) :
+        data = next(train_data_iterator)
+        optimizer.zero_grad()
+        # preparing inputs
+        input_ids, attention_mask = data["input_ids"], data["attention_mask"]
+        start_positions, end_positions, is_impossible = data["start_positions"], data["end_positions"], data["is_impossible"]
+        
+        # setting deivce
+        input_ids = input_ids.long().to(device)
+        attention_mask = attention_mask.long().to(device)
+        start_positions = start_positions.long().to(device)
+        end_positions = end_positions.long().to(device)
+        is_impossible = is_impossible.float().to(device)
 
-        # training model
-        for data in tqdm(train_dataloader) :
-            optimizer.zero_grad()
-            # preparing inputs
-            input_ids, attention_mask = data["input_ids"], data["attention_mask"]
-            start_positions, end_positions, is_impossible = data["start_positions"], data["end_positions"], data["is_impossible"]
-            
-            # setting deivce
-            input_ids = input_ids.long().to(device)
-            attention_mask = attention_mask.long().to(device)
-            start_positions = start_positions.long().to(device)
-            end_positions = end_positions.long().to(device)
-            is_impossible = is_impossible.float().to(device)
+        # forward model
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        start_logits, end_logits, impossible_logits = outputs["start_logits"], outputs["end_logits"], outputs["impossible_logits"]
+        
+        # calculating loss
+        start_loss = loss_ce(start_logits, start_positions)
+        end_loss = loss_ce(end_logits, end_positions)
+        position_loss = (start_loss + end_loss) / 2
+        train_position_loss += position_loss.item()
 
-            # forward model
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            start_logits, end_logits, impossible_logits = outputs["start_logits"], outputs["end_logits"], outputs["impossible_logits"]
-            
-            # calculating loss
-            start_loss = loss_ce(start_logits, start_positions)
-            end_loss = loss_ce(end_logits, end_positions)
-            position_loss = (start_loss + end_loss) / 2
+        impossible_loss = loss_bce(impossible_logits, is_impossible)
+        train_impossible_loss += impossible_loss.item()
+        loss = position_loss + impossible_loss
+        loss.backward()
 
-            impossible_loss = loss_bce(impossible_logits, is_impossible)
-            loss = position_loss + impossible_loss
-            loss.backward()
+        optimizer.step()
+        scheduler.step()
 
-            optimizer.step()
-            scheduler.step()
-            step += 1
+        if step > 0 and step % args.logging_steps == 0 :
+            train_position_loss /= args.logging_steps
+            train_impossible_loss /= args.logging_steps
+            info = {"train/learning_rate" : optimizer.param_groups[0]["lr"], 
+                "train/position_loss" : round(train_position_loss, 4), 
+                "train/impossible_loss" : round(train_impossible_loss, 4),
+                "train/step" : step
+            }
+            print(info)
+            wandb.log(info)
 
-            if step % args.logging_steps == 0 :
-                info = {"train/learning_rate" : optimizer.param_groups[0]["lr"], 
-                    "train/position_loss" : round(position_loss.item(), 4), 
-                    "train/impossible_loss" : round(impossible_loss.item(), 4),
-                    "train/step" : step
-                }
-                print(info)
-                wandb.log(info)
+            train_position_loss = 0.0
+            train_impossible_loss = 0.0
 
-            # -- Validation
+        # -- Validation
+        if step > 0 and step % args.save_steps == 0 :
             with torch.no_grad() :
-                if step % args.save_steps == 0 :
-                    model.eval()
-                    start_logit_vectors, end_logit_vectors, impossible_logit_vectors = [], [], []
-                    validation_position_loss, validation_impossible_loss = 0.0, 0.0
-                    print("Evaluation Model at step %d" %step)
+                model.eval()
+                start_logit_vectors, end_logit_vectors, impossible_logit_vectors = [], [], []
+                validation_position_loss, validation_impossible_loss = 0.0, 0.0
+                print("Evaluation Model at step %d" %step)
 
-                    # evaluating model
-                    for validation_data in tqdm(validation_dataloder) :
-                        # preparing inputs                        
-                        input_ids, attention_mask = validation_data["input_ids"], validation_data["attention_mask"]
-                        start_positions, end_positions, is_impossible = validation_data["start_positions"], validation_data["end_positions"], validation_data["is_impossible"]
-                        
-                        # setting deivce
-                        input_ids = input_ids.long().to(device)
-                        attention_mask = attention_mask.long().to(device)
-                        start_positions = start_positions.long().to(device)
-                        end_positions = end_positions.long().to(device)
-                        is_impossible = is_impossible.float().to(device)
-
-                        # forward model
-                        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                        start_logits, end_logits, impossible_logits = outputs["start_logits"], outputs["end_logits"], outputs["impossible_logits"]
-                        
-                        start_logit_vectors.extend([logit for logit in start_logits.detach().cpu().numpy()])
-                        end_logit_vectors.extend([logit for logit in end_logits.detach().cpu().numpy()])
-                        impossible_logit_vectors.extend([logit for logit in impossible_logits.detach().cpu().numpy()])
-
-                        # calculating loss
-                        start_loss = loss_ce(start_logits, start_positions)
-                        end_loss = loss_ce(end_logits, end_positions)
-                        validation_position_loss += (start_loss + end_loss) / 2
-                        validation_impossible_loss += loss_bce(impossible_logits, is_impossible)
-
-                    # validation loss
-                    validation_position_loss /= len(validation_dataloder)
-                    validation_impossible_loss /= len(validation_dataloder)
-
-                    # postprocess validation logits
-                    prediction_logit_vectors = {"start_logits" : start_logit_vectors, "end_logits" : end_logit_vectors, "impossible_logits" : impossible_logit_vectors}
-                    validation_predictions = postprocessor.predict(prediction_logit_vectors)
-
-                    # validation metircs
-                    validation_metrics = metrics.compute_metrics(validation_predictions, validation_labels)
-                    validation_info = {"eval/" + k : v for k, v in validation_metrics.items()}
-                    validation_info["eval/position_loss"] = round(validation_position_loss.item(), 4)
-                    validation_info["eval/impossible_loss"] = round(validation_impossible_loss.item(), 4)
-                    print(validation_info)
-                    wandb.log(validation_info)
-
-                    # saving model
-                    checkpoint_path = os.path.join(args.output_dir, "checkpoint-%d" %step)
-                    if not os.path.exists(checkpoint_path) :
-                        os.makedirs(checkpoint_path)
-                    model.save_pretrained(checkpoint_path)
-                    tokenizer.save_pretrained(checkpoint_path)
+                # evaluating model
+                for validation_data in tqdm(validation_dataloder) :
+                    # preparing inputs                        
+                    input_ids, attention_mask = validation_data["input_ids"], validation_data["attention_mask"]
+                    start_positions, end_positions, is_impossible = validation_data["start_positions"], validation_data["end_positions"], validation_data["is_impossible"]
                     
-                    model.train()
-   
+                    # setting deivce
+                    input_ids = input_ids.long().to(device)
+                    attention_mask = attention_mask.long().to(device)
+                    start_positions = start_positions.long().to(device)
+                    end_positions = end_positions.long().to(device)
+                    is_impossible = is_impossible.float().to(device)
+
+                    # forward model
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    start_logits, end_logits, impossible_logits = outputs["start_logits"], outputs["end_logits"], outputs["impossible_logits"]
+                    
+                    start_logit_vectors.extend([logit for logit in start_logits.detach().cpu().numpy()])
+                    end_logit_vectors.extend([logit for logit in end_logits.detach().cpu().numpy()])
+                    impossible_logit_vectors.extend([logit for logit in impossible_logits.detach().cpu().numpy()])
+
+                    # calculating loss
+                    start_loss = loss_ce(start_logits, start_positions)
+                    end_loss = loss_ce(end_logits, end_positions)
+                    validation_position_loss += (start_loss + end_loss) / 2
+                    validation_impossible_loss += loss_bce(impossible_logits, is_impossible)
+
+                # validation loss
+                validation_position_loss /= len(validation_dataloder)
+                validation_impossible_loss /= len(validation_dataloder)
+
+                # postprocess validation logits
+                prediction_logit_vectors = {"start_logits" : start_logit_vectors, "end_logits" : end_logit_vectors, "impossible_logits" : impossible_logit_vectors}
+                validation_predictions = postprocessor.predict(prediction_logit_vectors)
+
+                # validation metircs
+                validation_metrics = metrics.compute_metrics(validation_predictions, validation_labels)
+                validation_info = {"eval/" + k : v for k, v in validation_metrics.items()}
+                validation_info["eval/position_loss"] = round(validation_position_loss.item(), 4)
+                validation_info["eval/impossible_loss"] = round(validation_impossible_loss.item(), 4)
+                print(validation_info)
+                wandb.log(validation_info)
+
+                # saving model
+                checkpoint_path = os.path.join(args.output_dir, "checkpoint-%d" %step)
+                if not os.path.exists(checkpoint_path) :
+                    os.makedirs(checkpoint_path)
+                model.save_pretrained(checkpoint_path)
+                tokenizer.save_pretrained(checkpoint_path)
+                
+                model.train()
+
     # -- Finishing wandb
     wandb.finish()
 
