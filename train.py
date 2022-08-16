@@ -91,7 +91,7 @@ def train(args):
     model.to(device)
 
     # -- Optimizer & Scheduler
-    total_steps = len(train_dataloader) * args.epochs
+    total_steps = len(train_dataloader) * args.epochs if args.max_steps == -1 else args.max_steps
     warmup_steps = int(total_steps * args.warmup_ratio)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = LinearWarmupScheduler(optimizer=optimizer, 
@@ -119,13 +119,34 @@ def train(args):
         name=name
     )
 
-    training_args = {"epochs": args.epochs, "batch_size": args.batch_size, "learning_rate": args.learning_rate, "weight_decay": args.weight_decay, "warmup_ratio": args.warmup_ratio}
+    if args.max_steps == -1 :
+        training_args = {"epochs": args.epochs, 
+            "max_steps" : -1,
+            "batch_size": args.batch_size, 
+            "learning_rate": args.learning_rate, 
+            "weight_decay": args.weight_decay, 
+            "warmup_ratio": args.warmup_ratio
+        }
+    else :
+        training_args = {"epochs": -1,
+        "max_steps" : args.max_steps,
+        "batch_size": args.batch_size, 
+        "learning_rate": args.learning_rate, 
+        "weight_decay": args.weight_decay, 
+        "warmup_ratio": args.warmup_ratio
+    }
+
     wandb.config.update(training_args)
 
     # -- Training
     train_position_loss, train_impossible_loss = 0.0, 0.0
     for step in tqdm(range(total_steps)) :
-        data = next(train_data_iterator)
+        try :
+            data = next(train_data_iterator)
+        except StopIteration :
+            train_data_iterator = iter(train_dataloader)
+            data = next(train_data_iterator)
+            
         optimizer.zero_grad()
         # preparing inputs
         input_ids, attention_mask = data["input_ids"], data["attention_mask"]
@@ -260,6 +281,9 @@ def main() :
     )
     parser.add_argument(
         "--epochs", type=int, default=5
+    )
+    parser.add_argument(
+        "--max_steps", type=int, default=-1
     )
     parser.add_argument(
         "--logging_steps", type=int, default=500
