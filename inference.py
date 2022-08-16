@@ -90,8 +90,9 @@ def inference(args) :
         for pred in predictions
     ]
 
+    output_path = os.path.join(args.output_dir, args.output_file)
     df = pd.DataFrame({"id" : pred_ids, "text" : pred_texts})
-    df.to_csv(args.output_file, index=False)
+    df.to_csv(output_path, index=False)
 
 def main() :
     parser = argparse.ArgumentParser()
@@ -108,6 +109,11 @@ def main() :
     )
     parser.add_argument(
         "--data_dir", type=str, default="klue-mrc-v1.1"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="results",
     )
     parser.add_argument(
         "--output_file",
