@@ -46,7 +46,7 @@ def inference(args) :
     # -- Dataloader
     test_dataloader = DataLoader(test_dataset, 
         batch_size=args.batch_size, 
-        shuffle=True,
+        shuffle=False,
         num_workers=args.num_workers,
         collate_fn=data_collator
     )
@@ -81,12 +81,12 @@ def inference(args) :
         # postprocess validation logits
         prediction_logit_vectors = {"start_logits" : start_logit_vectors, "end_logits" : end_logit_vectors, "impossible_logits" : impossible_logit_vectors}
         predictions = postprocessor.predict(prediction_logit_vectors)
-
+    
     # -- Writing output file
     print("\nWriting predictions to file")
     pred_ids = [pred["id"] for pred in predictions]
     pred_texts = [
-        pred["prediction_text"] if pred["no_answer_probability"] > 0.0 else "" 
+        pred["prediction_text"] if pred["no_answer_probability"] < 0.0 else "" 
         for pred in predictions
     ]
 
